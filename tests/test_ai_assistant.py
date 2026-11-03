@@ -14,6 +14,8 @@ import pandas as pd
 import numpy as np
 from utils.ai_assistant import (
     DEFAULT_GEMINI_MODEL,
+    sanitize_gemini_model,
+    get_gemini_model,
     build_dataset_context_summary,
     answer_query_deterministically,
     get_gemini_api_key,
@@ -70,6 +72,42 @@ class TestAIAssistant(unittest.TestCase):
         """Verify the default model constant is gemini-3.8-flash."""
         self.assertEqual(DEFAULT_GEMINI_MODEL, "gemini-3.8-flash")
 
+    def test_sanitize_gemini_model_intercepts_2_5_flash(self):
+        """Verify any attempt to use gemini-2.5-flash is intercepted and upgraded to gemini-3.8-flash."""
+        self.assertEqual(sanitize_gemini_model("gemini-2.5-flash"), "gemini-3.8-flash")
+        self.assertEqual(sanitize_gemini_model("models/gemini-2.5-flash"), "gemini-3.8-flash")
+        self.assertEqual(sanitize_gemini_model("gemini-2.5-pro"), "gemini-3.8-flash")
+        self.assertEqual(sanitize_gemini_model(""), "gemini-3.8-flash")
+        self.assertEqual(sanitize_gemini_model(None), "gemini-3.8-flash")
+        self.assertEqual(sanitize_gemini_model("gemini-3.8-flash"), "gemini-3.8-flash")
+        self.assertEqual(sanitize_gemini_model("models/gemini-3.8-flash"), "gemini-3.8-flash")
+
+    def test_get_gemini_model_with_env_override(self):
+        """Verify environment variables with deprecated models are safely sanitized."""
+        with patch.dict("os.environ", {"GEMINI_MODEL": "gemini-2.5-flash"}):
+            self.assertEqual(get_gemini_model(), "gemini-3.8-flash")
+
+        with patch.dict("os.environ", {"GEMINI_MODEL": "gemini-3.8-flash"}):
+            self.assertEqual(get_gemini_model(), "gemini-3.8-flash")
+
+    def test_query_gemini_assistant_intercepts_explicit_2_5_param(self):
+        """Even if model='gemini-2.5-flash' is explicitly passed, it must be upgraded to gemini-3.8-flash."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Safe response"
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch("google.genai.Client", return_value=mock_client):
+            ans = query_gemini_assistant(
+                prompt="test",
+                context="context",
+                api_key="key",
+                model="gemini-2.5-flash"
+            )
+            self.assertEqual(ans, "Safe response")
+            call_kwargs = mock_client.models.generate_content.call_args.kwargs
+            self.assertEqual(call_kwargs.get("model"), "gemini-3.8-flash")
+
     def test_query_gemini_assistant_uses_gemini_3_8_flash(self):
         """Verify query_gemini_assistant calls generate_content with gemini-3.8-flash."""
         mock_client = MagicMock()
@@ -115,27 +153,37 @@ class TestAIAssistant(unittest.TestCase):
             self.assertIn("You have salary and bonus columns.", contents)
 
     def test_query_gemini_assistant_error_handling(self):
-        """Verify user-friendly error messages for invalid key, quota, and connection errors."""
-        # 1. Invalid key error
+        """Verify user-friendly error messages distinguishing model, key, quota, and network errors."""
+        # 1. Deprecated / unavailable model error (404)
+        with patch("google.genai.Client", side_effect=Exception("404 NOT_FOUND: models/gemini-2.5-flash is no longer available to new users.")):
+            ans = query_gemini_assistant("test", "context", "key")
+            self.assertIn("Model Error", ans)
+            self.assertIn("gemini-3.8-flash", ans)
+
+        # 2. Invalid key error
         with patch("google.genai.Client", side_effect=Exception("API_KEY_INVALID: API key not valid")):
             ans = query_gemini_assistant("test", "context", "bad-key")
             self.assertIn("API Key Error", ans)
 
-        # 2. Quota exceeded error
-        with patch("google.genai.Client", side_effect=Exception("RESOURCE_EXHAUSTED: rate limit exceeded")):
+        # 3. Quota exceeded error
+        with patch("google.genai.Client", side_effect=Exception("RESOURCE_EXHAUSTED: 429 rate limit exceeded")):
             ans = query_gemini_assistant("test", "context", "key")
             self.assertIn("Quota Exceeded", ans)
 
-        # 3. Service disabled error
+        # 4. Service disabled error
         with patch("google.genai.Client", side_effect=Exception("SERVICE_DISABLED: Gemini API has not been used")):
             ans = query_gemini_assistant("test", "context", "key")
             self.assertIn("API Not Enabled", ans)
 
-        # 4. General connection error
-        with patch("google.genai.Client", side_effect=Exception("Timeout connecting to server")):
+        # 5. Network / timeout error
+        with patch("google.genai.Client", side_effect=Exception("ConnectionError: Failed to establish a connection to host")):
+            ans = query_gemini_assistant("test", "context", "key")
+            self.assertIn("Network Error", ans)
+
+        # 6. General fallback error
+        with patch("google.genai.Client", side_effect=Exception("Unexpected internal server state")):
             ans = query_gemini_assistant("test", "context", "key")
             self.assertIn("Connection Error", ans)
-            self.assertIn("Timeout connecting to server", ans)
 
 
 if __name__ == "__main__":

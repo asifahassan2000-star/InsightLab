@@ -33,6 +33,50 @@ from utils.insights_engine import detect_outliers_iqr, compute_dataset_quality_s
 DEFAULT_GEMINI_MODEL: str = "gemini-3.8-flash"
 
 
+def sanitize_gemini_model(model: Optional[str]) -> str:
+    """
+    Sanitizes and normalizes the Gemini model identifier.
+    Guarantees that deprecated models (such as gemini-2.5-flash) or empty/invalid
+    values are strictly intercepted and upgraded to 'gemini-3.8-flash'.
+    Prevents any old default or fallback configuration from silently switching back to gemini-2.5-flash.
+    """
+    if not model or not isinstance(model, str):
+        return DEFAULT_GEMINI_MODEL
+    cleaned = model.strip()
+    if not cleaned or "2.5" in cleaned:
+        return DEFAULT_GEMINI_MODEL
+    if cleaned.startswith("models/"):
+        cleaned = cleaned[len("models/"):]
+    return cleaned
+
+
+def get_gemini_model() -> str:
+    """
+    Resolves the active Gemini model name from:
+    1. Streamlit session state (`user_gemini_model`).
+    2. Streamlit secrets (`GEMINI_MODEL` or `st.secrets["gemini"]["model"]`).
+    3. OS environment variables (`GEMINI_MODEL` or `GOOGLE_GENAI_MODEL`).
+    4. Defaults strictly to DEFAULT_GEMINI_MODEL ('gemini-3.8-flash').
+    """
+    try:
+        import streamlit as st
+        if "user_gemini_model" in st.session_state and st.session_state["user_gemini_model"]:
+            return sanitize_gemini_model(st.session_state["user_gemini_model"])
+        if hasattr(st, "secrets"):
+            if "GEMINI_MODEL" in st.secrets:
+                return sanitize_gemini_model(str(st.secrets["GEMINI_MODEL"]))
+            if "gemini" in st.secrets and isinstance(st.secrets["gemini"], dict) and "model" in st.secrets["gemini"]:
+                return sanitize_gemini_model(str(st.secrets["gemini"]["model"]))
+    except Exception:
+        pass
+
+    env_model = os.environ.get("GEMINI_MODEL") or os.environ.get("GOOGLE_GENAI_MODEL")
+    if env_model:
+        return sanitize_gemini_model(env_model)
+
+    return DEFAULT_GEMINI_MODEL
+
+
 def get_gemini_api_key() -> Optional[str]:
     """
     Retrieves the Gemini API key securely from:
@@ -160,11 +204,12 @@ def query_gemini_assistant(
     context: str,
     api_key: str,
     chat_history: Optional[List[Dict[str, str]]] = None,
-    model: str = DEFAULT_GEMINI_MODEL
+    model: Optional[str] = None
 ) -> str:
     """
     Sends the user query and grounded statistical context to Google Gemini.
     """
+    active_model = sanitize_gemini_model(model or get_gemini_model())
     try:
         from google import genai
         from google.genai import types
@@ -201,9 +246,9 @@ def query_gemini_assistant(
             f"Please provide an accurate, structured, and pedagogical answer:"
         )
 
-        # Call Gemini (gemini-3.8-flash is the modern, fast, and supported model for tabular analysis)
+        # Call Gemini (gemini-3.8-flash is the active, supported model for tabular analysis)
         response = client.models.generate_content(
-            model=model,
+            model=active_model,
             contents=full_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -216,12 +261,59 @@ def query_gemini_assistant(
 
     except Exception as e:
         error_msg = str(e)
-        if "API_KEY_INVALID" in error_msg or "invalid api key" in error_msg.lower():
+        error_lower = error_msg.lower()
+
+        # 1. Invalid, not found, or deprecated model error (404)
+        if (
+            "not_found" in error_lower
+            or "404" in error_msg
+            or "is not found" in error_lower
+            or "no longer available" in error_lower
+            or "unsupported model" in error_lower
+            or ("models/" in error_lower and "not found" in error_lower)
+        ):
+            return (
+                f"❌ **Model Error (404):** The requested model (`{active_model}`) is unavailable or deprecated. "
+                f"InsightLab is configured to use `{DEFAULT_GEMINI_MODEL}`."
+            )
+
+        # 2. Invalid API key error (400 / 401)
+        elif (
+            "api_key_invalid" in error_lower
+            or "invalid api key" in error_lower
+            or "api key not valid" in error_lower
+            or ("invalid_argument" in error_lower and "key" in error_lower)
+        ):
             return "❌ **API Key Error:** The provided Gemini API key is invalid. Please verify your API key in Streamlit secrets or in the API key settings."
-        elif "RESOURCE_EXHAUSTED" in error_msg:
-            return "⏳ **Quota Exceeded:** You have reached your Gemini API request limit. Please wait a moment before trying again."
-        elif "SERVICE_DISABLED" in error_msg or "has not been used in project" in error_msg:
-            return f"❌ **API Not Enabled:** Gemini API is disabled on this Google Cloud project. Enable it at https://console.developers.google.com/apis/api/generativelanguage.googleapis.com/overview"
+
+        # 3. Quota exceeded or rate limited (429)
+        elif "resource_exhausted" in error_lower or "429" in error_msg or "quota" in error_lower:
+            return "⏳ **Quota Exceeded (429):** You have reached your Gemini API request limit. Please wait a moment before trying again."
+
+        # 4. Service disabled or permission denied (403)
+        elif (
+            "permission_denied" in error_lower
+            or "403" in error_msg
+            or "service_disabled" in error_lower
+            or "has not been used in project" in error_lower
+        ):
+            return (
+                "❌ **API Not Enabled (403):** Gemini API is disabled on this Google Cloud project. "
+                "Enable it at https://console.developers.google.com/apis/api/generativelanguage.googleapis.com/overview"
+            )
+
+        # 5. Network, connection, or timeout errors
+        elif (
+            "timeout" in error_lower
+            or "connection" in error_lower
+            or "network" in error_lower
+            or "getaddrinfo" in error_lower
+            or "disconnected" in error_lower
+            or "unreachable" in error_lower
+        ):
+            return f"🌐 **Network Error:** Could not connect to Gemini API ({error_msg}). Please check your internet connection."
+
+        # 6. General fallback
         else:
             return f"⚠️ **Connection Error:** Could not reach Gemini API: {error_msg}. Using local analytical engine fallback."
 
