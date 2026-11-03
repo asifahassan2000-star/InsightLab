@@ -14,7 +14,7 @@ Features:
    compiled by Pandas and NumPy. Raw personal rows are never transmitted.
 
 3. Graceful Multi-Mode Operation:
-   - Full Generative Power: Uses official Google GenAI SDK (Gemini 2.5 Flash)
+   - Full Generative Power: Uses official Google GenAI SDK (Gemini 3.8 Flash)
      when an API key is provided via Streamlit secrets or settings.
    - Deterministic Fallback: Automatically handles analytical queries locally
      even if no API key is configured.
@@ -112,7 +112,7 @@ def render_ai_assistant():
             "to Google Gemini. Individual personal records or sensitive row-level data are never transmitted."
         )
         if api_key:
-            st.success("✅ **Gemini API Key Active:** Connected to Google Gemini 2.5 Flash.")
+            st.success("✅ **Gemini API Key Active:** Connected to Google Gemini (gemini-3.8-flash).")
         else:
             st.info(
                 "💡 **No API Key configured:** InsightLab is currently running in **Local Analytical Mode**. "

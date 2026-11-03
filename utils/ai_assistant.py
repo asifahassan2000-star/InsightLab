@@ -29,6 +29,9 @@ import numpy as np
 from utils.statistical_analyzer import compute_dataset_statistics_table, compute_correlation_matrix, get_top_correlations
 from utils.insights_engine import detect_outliers_iqr, compute_dataset_quality_score
 
+# Default supported Gemini model for InsightLab
+DEFAULT_GEMINI_MODEL: str = "gemini-3.8-flash"
+
 
 def get_gemini_api_key() -> Optional[str]:
     """
@@ -47,6 +50,8 @@ def get_gemini_api_key() -> Optional[str]:
                 return str(st.secrets["GEMINI_API_KEY"]).strip()
             if "GOOGLE_API_KEY" in st.secrets:
                 return str(st.secrets["GOOGLE_API_KEY"]).strip()
+            if "gemini" in st.secrets and isinstance(st.secrets["gemini"], dict) and "api_key" in st.secrets["gemini"]:
+                return str(st.secrets["gemini"]["api_key"]).strip()
     except Exception:
         pass
 
@@ -154,7 +159,8 @@ def query_gemini_assistant(
     prompt: str,
     context: str,
     api_key: str,
-    chat_history: Optional[List[Dict[str, str]]] = None
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    model: str = DEFAULT_GEMINI_MODEL
 ) -> str:
     """
     Sends the user query and grounded statistical context to Google Gemini.
@@ -177,16 +183,27 @@ def query_gemini_assistant(
             "6. When explaining complex terms (like R2, standard deviation, skewness, or IQR), provide a brief, intuitive analogy."
         )
 
+        history_context = ""
+        if chat_history and len(chat_history) > 1:
+            prev_turns = [m for m in chat_history[:-1] if m.get("content")]
+            if prev_turns:
+                history_lines = ["=== RECENT CONVERSATION CONTEXT ==="]
+                for msg in prev_turns[-6:]:
+                    role_label = "User" if msg.get("role") == "user" else "Assistant"
+                    history_lines.append(f"{role_label}: {msg.get('content')}")
+                history_context = "\n".join(history_lines) + "\n\n"
+
         full_prompt = (
             f"Here is the verified profile of the user's currently active dataset:\n\n"
             f"{context}\n\n"
+            f"{history_context}"
             f"User Question: {prompt}\n\n"
             f"Please provide an accurate, structured, and pedagogical answer:"
         )
 
-        # Call Gemini (gemini-2.5-flash is fast, modern, and highly capable for tabular analysis)
+        # Call Gemini (gemini-3.8-flash is the modern, fast, and supported model for tabular analysis)
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=model,
             contents=full_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -203,6 +220,8 @@ def query_gemini_assistant(
             return "❌ **API Key Error:** The provided Gemini API key is invalid. Please verify your API key in Streamlit secrets or in the API key settings."
         elif "RESOURCE_EXHAUSTED" in error_msg:
             return "⏳ **Quota Exceeded:** You have reached your Gemini API request limit. Please wait a moment before trying again."
+        elif "SERVICE_DISABLED" in error_msg or "has not been used in project" in error_msg:
+            return f"❌ **API Not Enabled:** Gemini API is disabled on this Google Cloud project. Enable it at https://console.developers.google.com/apis/api/generativelanguage.googleapis.com/overview"
         else:
             return f"⚠️ **Connection Error:** Could not reach Gemini API: {error_msg}. Using local analytical engine fallback."
 

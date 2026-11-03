@@ -87,7 +87,7 @@ InsightLab is an interactive, modern data analysis platform built with Python an
 2. **Pedagogical AI Tutor**: Explains statistical findings, data cleaning rationales, visualizations, and machine learning metrics with beginner analogies.
 3. **Grounded Statistical Context (Zero Hallucination)**: Compiles verified mathematical facts, value counts, and correlation tables to strictly anchor AI answers.
 4. **Privacy-Preserving**: Transmits structural metadata and statistical aggregations—never raw personal records or sensitive customer details.
-5. **Multi-Mode Support (Gemini SDK & Local Engine)**: Uses Google GenAI SDK (`google-genai` with Gemini 2.5 Flash) when configured, and falls back to a deterministic local Pandas engine when running offline.
+5. **Multi-Mode Support (Gemini SDK & Local Engine)**: Uses Google GenAI SDK (`google-genai` with Gemini 3.8 Flash) when configured, and falls back to a deterministic local Pandas engine when running offline.
 
 ---
 

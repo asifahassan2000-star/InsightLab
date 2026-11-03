@@ -148,6 +148,131 @@ def build_analysis_payload(analysis_type: str = "statistical_analysis") -> Dict[
     return payload
 
 
+def _safe_float(val: Any) -> float:
+    """
+    Safely converts a scalar to a JSON-serializable float, defaulting to 0.0 for NaN/Inf/invalid.
+    Never attempts to convert non-scalar or iterable objects.
+    """
+    if val is None or pd.isna(val):
+        return 0.0
+    try:
+        if hasattr(val, "__iter__") and not isinstance(val, (str, bytes)):
+            return 0.0
+        num = float(val)
+        if np.isnan(num) or np.isinf(num):
+            return 0.0
+        return float(num)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def clean_feature_importance(fi: Any) -> Dict[str, float]:
+    """
+    Safely converts feature importance from DataFrame, Series, dict, None, or empty value
+    into a clean, JSON-serializable Python dictionary mapping feature names to floats.
+    Handles NaN, Inf, and invalid numeric values safely without ambiguous truth-value checks.
+    """
+    if fi is None:
+        return {}
+
+    raw_pairs = []
+
+    if isinstance(fi, pd.DataFrame):
+        if fi.empty:
+            return {}
+
+        cols = list(fi.columns)
+        feat_col = None
+        imp_col = None
+
+        # Look for explicit feature name column
+        for c in cols:
+            c_str = str(c).lower().strip()
+            if c_str in ("feature", "features", "name", "variable", "var", "column", "col"):
+                feat_col = c
+                break
+        if feat_col is None:
+            for c in cols:
+                c_str = str(c).lower().strip()
+                if any(term in c_str for term in ("feature", "var", "col")):
+                    feat_col = c
+                    break
+
+        # Look for explicit importance column
+        for c in cols:
+            if c == feat_col:
+                continue
+            c_str = str(c).lower().strip()
+            if c_str in ("importance", "importances", "weight", "weights", "score", "scores", "coef", "coefficient", "value", "val"):
+                imp_col = c
+                break
+        if imp_col is None:
+            for c in cols:
+                if c == feat_col:
+                    continue
+                c_str = str(c).lower().strip()
+                if any(term in c_str for term in ("importance", "weight", "score", "coef")):
+                    imp_col = c
+                    break
+
+        # Fallback if columns not identified by name
+        if feat_col is None or imp_col is None:
+            if len(cols) == 1:
+                imp_col = cols[0]
+                feat_col = None
+            elif len(cols) >= 2:
+                remaining = [c for c in cols if c not in (feat_col, imp_col)]
+                if imp_col is None:
+                    for c in remaining:
+                        if pd.api.types.is_numeric_dtype(fi[c]):
+                            imp_col = c
+                            remaining.remove(c)
+                            break
+                    if imp_col is None and remaining:
+                        imp_col = remaining.pop(-1)
+                if feat_col is None:
+                    for c in remaining:
+                        if not pd.api.types.is_numeric_dtype(fi[c]):
+                            feat_col = c
+                            remaining.remove(c)
+                            break
+                    if feat_col is None and remaining:
+                        feat_col = remaining.pop(0)
+
+        features = fi[feat_col].tolist() if feat_col is not None else [str(idx) for idx in fi.index]
+        importances = fi[imp_col].tolist() if imp_col is not None else []
+        raw_pairs = list(zip(features, importances))
+
+    elif isinstance(fi, pd.Series):
+        if fi.empty:
+            return {}
+        raw_pairs = list(zip(fi.index.tolist(), fi.tolist()))
+
+    elif isinstance(fi, dict):
+        if not fi:
+            return {}
+        raw_pairs = list(fi.items())
+
+    elif isinstance(fi, (list, tuple)):
+        valid_items = []
+        for item in fi:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                valid_items.append((item[0], item[1]))
+        raw_pairs = valid_items
+
+    else:
+        return {}
+
+    clean_dict: Dict[str, float] = {}
+    for k, v in raw_pairs:
+        key_str = str(k).strip()
+        if not key_str:
+            continue
+        clean_dict[key_str] = _safe_float(v)
+
+    return clean_dict
+
+
 def build_ml_model_payload() -> Dict[str, Any]:
     """
     Builds a machine learning model metadata payload.
@@ -162,16 +287,16 @@ def build_ml_model_payload() -> Dict[str, Any]:
         return {"name": "No Model Trained", "task": ml_task, "error": "No model in session"}
 
     metrics = ml_bundle.get("metrics", {})
-    clean_metrics = {
-        str(k): float(v) if isinstance(v, (int, float, np.number)) else str(v)
-        for k, v in metrics.items()
-    }
+    clean_metrics = {}
+    if isinstance(metrics, dict):
+        for k, v in metrics.items():
+            if isinstance(v, (int, float, np.number)):
+                clean_metrics[str(k)] = _safe_float(v)
+            else:
+                clean_metrics[str(k)] = str(v)
 
-    fi = ml_bundle.get("feature_importance", {})
-    clean_fi = {
-        str(k): float(v) if isinstance(v, (int, float, np.number)) else str(v)
-        for k, v in fi.items()
-    } if fi else {}
+    fi = ml_bundle.get("feature_importance")
+    clean_fi = clean_feature_importance(fi)
 
     algorithm = ml_bundle.get("algorithm", "Model")
     name = f"{algorithm} ({ml_task.capitalize()}) - {dataset_name}"

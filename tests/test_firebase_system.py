@@ -15,6 +15,7 @@ What We Are Testing:
 
 import pytest
 import datetime
+import json
 import pandas as pd
 import numpy as np
 from unittest.mock import patch, MagicMock
@@ -48,6 +49,7 @@ from utils.smart_save import (
     build_analysis_payload,
     build_ml_model_payload,
     build_report_payload,
+    clean_feature_importance,
 )
 
 
@@ -234,6 +236,96 @@ class TestSmartSavePayloads:
             assert payload["task"] == "regression"
             assert payload["target_col"] == "revenue"
             assert payload["feature_cols"] == ["units"]
+            assert payload["feature_importance"] == {"units": 1.0}
+            assert json.dumps(payload)
+
+    def test_build_ml_model_payload_with_dataframe(self, mock_session):
+        """Verifies that DataFrame feature_importance does not raise ambiguous truth value error."""
+        fi_df = pd.DataFrame({
+            "Feature": ["units", "store_size"],
+            "Importance": [0.75, 0.25]
+        })
+        mock_session["ml_model_bundle"]["feature_importance"] = fi_df
+        with patch("streamlit.session_state", mock_session):
+            payload = build_ml_model_payload()
+            assert payload["feature_importance"] == {"units": 0.75, "store_size": 0.25}
+            assert json.dumps(payload)
+
+    def test_build_ml_model_payload_with_series(self, mock_session):
+        """Verifies that Series feature_importance is handled correctly."""
+        fi_series = pd.Series([0.65, 0.35], index=["units", "discount"])
+        mock_session["ml_model_bundle"]["feature_importance"] = fi_series
+        with patch("streamlit.session_state", mock_session):
+            payload = build_ml_model_payload()
+            assert payload["feature_importance"] == {"units": 0.65, "discount": 0.35}
+            assert json.dumps(payload)
+
+    def test_build_ml_model_payload_with_empty_dataframe(self, mock_session):
+        """Verifies that an empty DataFrame feature_importance produces an empty dict."""
+        mock_session["ml_model_bundle"]["feature_importance"] = pd.DataFrame()
+        with patch("streamlit.session_state", mock_session):
+            payload = build_ml_model_payload()
+            assert payload["feature_importance"] == {}
+            assert json.dumps(payload)
+
+    def test_build_ml_model_payload_with_empty_series(self, mock_session):
+        """Verifies that an empty Series feature_importance produces an empty dict."""
+        mock_session["ml_model_bundle"]["feature_importance"] = pd.Series(dtype=float)
+        with patch("streamlit.session_state", mock_session):
+            payload = build_ml_model_payload()
+            assert payload["feature_importance"] == {}
+            assert json.dumps(payload)
+
+    def test_build_ml_model_payload_with_none(self, mock_session):
+        """Verifies that None feature_importance produces an empty dict."""
+        mock_session["ml_model_bundle"]["feature_importance"] = None
+        with patch("streamlit.session_state", mock_session):
+            payload = build_ml_model_payload()
+            assert payload["feature_importance"] == {}
+            assert json.dumps(payload)
+
+    def test_build_ml_model_payload_with_nan_and_inf(self, mock_session):
+        """Verifies that NaN and Inf in feature importance are converted to 0.0 for clean JSON."""
+        fi_df = pd.DataFrame({
+            "Feature": ["f_nan", "f_inf", "f_valid"],
+            "Importance": [np.nan, float("inf"), 0.42]
+        })
+        mock_session["ml_model_bundle"]["feature_importance"] = fi_df
+        with patch("streamlit.session_state", mock_session):
+            payload = build_ml_model_payload()
+            assert payload["feature_importance"]["f_nan"] == 0.0
+            assert payload["feature_importance"]["f_inf"] == 0.0
+            assert payload["feature_importance"]["f_valid"] == 0.42
+            assert json.dumps(payload)
+
+    def test_build_ml_model_payload_with_real_trained_model(self):
+        """End-to-end test with a real trained regression model from ml_engine."""
+        from utils.ml_engine import train_regression_model
+        train_df = pd.DataFrame({
+            "x1": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            "x2": [10.0, 20.0, 15.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0],
+            "y": [5.0, 9.0, 11.0, 17.0, 20.0, 25.0, 31.0, 36.0, 41.0, 47.0]
+        })
+        result = train_regression_model(
+            train_df,
+            target_col="y",
+            feature_cols=["x1", "x2"],
+            algorithm="Linear Regression"
+        )
+        assert isinstance(result["feature_importance"], pd.DataFrame)
+        session = {
+            "ml_model_bundle": result,
+            "ml_task": "regression",
+            "dataset_name": "real_train.csv"
+        }
+        with patch("streamlit.session_state", session):
+            payload = build_ml_model_payload()
+            assert payload["task"] == "regression"
+            assert isinstance(payload["feature_importance"], dict)
+            assert len(payload["feature_importance"]) == 2
+            assert "x1" in payload["feature_importance"]
+            assert "x2" in payload["feature_importance"]
+            assert json.dumps(payload)
 
     def test_build_report_payload(self, mock_session):
         with patch("streamlit.session_state", mock_session):
@@ -241,6 +333,74 @@ class TestSmartSavePayloads:
             assert payload["name"] == "Executive Summary PDF"
             assert payload["report_type"] == "pdf"
             assert payload["has_ml"] is True
+
+
+class TestFeatureImportanceCleaning:
+    """Detailed unit tests for clean_feature_importance()."""
+
+    def test_clean_fi_none(self):
+        assert clean_feature_importance(None) == {}
+
+    def test_clean_fi_empty_dict(self):
+        assert clean_feature_importance({}) == {}
+
+    def test_clean_fi_dict_with_values(self):
+        fi = {"units": 1, "price": 0.75}
+        result = clean_feature_importance(fi)
+        assert result == {"units": 1.0, "price": 0.75}
+        assert json.dumps(result)
+
+    def test_clean_fi_dict_with_nan_inf_invalid(self):
+        fi = {"a": np.nan, "b": float("inf"), "c": "invalid", "d": 2.5}
+        result = clean_feature_importance(fi)
+        assert result == {"a": 0.0, "b": 0.0, "c": 0.0, "d": 2.5}
+        assert json.dumps(result)
+
+    def test_clean_fi_empty_dataframe(self):
+        assert clean_feature_importance(pd.DataFrame()) == {}
+
+    def test_clean_fi_dataframe_feature_importance_cols(self):
+        df = pd.DataFrame({
+            "Feature": ["units", "cost"],
+            "Importance": [0.65, 0.35]
+        })
+        result = clean_feature_importance(df)
+        assert result == {"units": 0.65, "cost": 0.35}
+        assert json.dumps(result)
+
+    def test_clean_fi_dataframe_single_col_with_index(self):
+        df = pd.DataFrame({"Importance": [0.6, 0.4]}, index=["featA", "featB"])
+        result = clean_feature_importance(df)
+        assert result == {"featA": 0.6, "featB": 0.4}
+        assert json.dumps(result)
+
+    def test_clean_fi_dataframe_with_nan_inf_missing(self):
+        df = pd.DataFrame({
+            "Feature": ["f1", "f2", "f3"],
+            "Importance": [np.nan, float("-inf"), "bad"]
+        })
+        result = clean_feature_importance(df)
+        assert result == {"f1": 0.0, "f2": 0.0, "f3": 0.0}
+        assert json.dumps(result)
+
+    def test_clean_fi_empty_series(self):
+        assert clean_feature_importance(pd.Series(dtype=float)) == {}
+
+    def test_clean_fi_series_with_values(self):
+        s = pd.Series([0.7, 0.3], index=["feat1", "feat2"])
+        result = clean_feature_importance(s)
+        assert result == {"feat1": 0.7, "feat2": 0.3}
+        assert json.dumps(result)
+
+    def test_clean_fi_series_with_nan(self):
+        s = pd.Series([0.5, np.nan], index=["feat1", "feat2"])
+        result = clean_feature_importance(s)
+        assert result == {"feat1": 0.5, "feat2": 0.0}
+        assert json.dumps(result)
+
+    def test_clean_fi_invalid_type(self):
+        assert clean_feature_importance(12345) == {}
+        assert clean_feature_importance("not_valid") == {}
 
 
 # =============================================================================
