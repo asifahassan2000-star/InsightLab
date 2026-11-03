@@ -36,6 +36,22 @@ def main():
         initial_sidebar_state="expanded"
     )
 
+    # Hide the default Streamlit Deploy button
+    st.markdown(
+        """
+        <style>
+        .stAppDeployButton,
+        .stDeployButton,
+        [data-testid="stAppDeployButton"],
+        [data-testid="stDeployButton"] {
+            display: none !important;
+            visibility: hidden !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
     # --------------------------------------------------------------------------
     # 2. Sidebar Setup & Navigation
     # --------------------------------------------------------------------------
