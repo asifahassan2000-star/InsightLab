@@ -20,17 +20,127 @@ Core Principles:
      analytical questions even without an API key!
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import os
 import re
+import time
+import random
+import logging
 import pandas as pd
 import numpy as np
 
 from utils.statistical_analyzer import compute_dataset_statistics_table, compute_correlation_matrix, get_top_correlations
 from utils.insights_engine import detect_outliers_iqr, compute_dataset_quality_score
 
+logger = logging.getLogger("insightlab.ai_assistant")
+
 # Default supported Gemini model for InsightLab
 DEFAULT_GEMINI_MODEL: str = "gemini-3.8-flash"
+
+# Retry configuration for temporary failures (503, 429, Network)
+MAX_GEMINI_RETRIES: int = 3
+INITIAL_RETRY_DELAY: float = 1.0
+MAX_RETRY_DELAY: float = 8.0
+_sleep_fn = time.sleep
+
+
+def _sanitize_log_message(msg: str) -> str:
+    """
+    Removes any API keys or credential patterns from error messages before logging or display.
+    """
+    if not msg:
+        return ""
+    sanitized = re.sub(r"AIzaSy[A-Za-z0-9_-]{33}", "[REDACTED_KEY]", str(msg))
+    sanitized = re.sub(r"([?&]key=)[^&]+", r"\1[REDACTED_KEY]", sanitized)
+    return sanitized
+
+
+def _is_retryable_error(e: Exception) -> Tuple[bool, str]:
+    """
+    Determines if an error is temporary and eligible for retry.
+    Returns (is_retryable, error_category).
+
+    Retryable errors:
+    - 503 UNAVAILABLE (high demand, temporary outage)
+    - 429 RESOURCE_EXHAUSTED / Rate limit / Quota exceeded
+    - 500 INTERNAL / 502 BAD_GATEWAY / 504 GATEWAY_TIMEOUT
+    - Network/Connection/Timeout errors
+
+    Permanent errors (DO NOT retry):
+    - 400 INVALID_ARGUMENT (malformed request)
+    - 401 UNAUTHENTICATED / API_KEY_INVALID (invalid key)
+    - 403 PERMISSION_DENIED / SERVICE_DISABLED (API disabled on project)
+    - 404 NOT_FOUND (invalid/deprecated model)
+    """
+    error_msg = str(e)
+    error_lower = error_msg.lower()
+
+    # 1. Permanent errors (never retry)
+    if (
+        "not_found" in error_lower
+        or "404" in error_msg
+        or "no longer available" in error_lower
+        or "unsupported model" in error_lower
+        or ("models/" in error_lower and "not found" in error_lower)
+    ):
+        return False, "model_not_found"
+
+    if (
+        "api_key_invalid" in error_lower
+        or "invalid api key" in error_lower
+        or "api key not valid" in error_lower
+        or ("invalid_argument" in error_lower and "key" in error_lower)
+    ):
+        return False, "invalid_api_key"
+
+    if (
+        "permission_denied" in error_lower
+        or "403" in error_msg
+        or "service_disabled" in error_lower
+        or "has not been used in project" in error_lower
+    ):
+        return False, "permission_denied"
+
+    # 2. Temporary / retryable errors
+    if (
+        "503" in error_msg
+        or "unavailable" in error_lower
+        or "high demand" in error_lower
+        or "overloaded" in error_lower
+    ):
+        return True, "503_unavailable"
+
+    if (
+        "429" in error_msg
+        or "resource_exhausted" in error_lower
+        or "rate limit" in error_lower
+        or "quota" in error_lower
+    ):
+        return True, "429_rate_limit"
+
+    if (
+        "500" in error_msg
+        or "502" in error_msg
+        or "504" in error_msg
+        or "bad gateway" in error_lower
+        or "gateway timeout" in error_lower
+        or "internal error" in error_lower
+    ):
+        return True, "5xx_server_error"
+
+    if (
+        "timeout" in error_lower
+        or "connection" in error_lower
+        or "network" in error_lower
+        or "getaddrinfo" in error_lower
+        or "disconnected" in error_lower
+        or "unreachable" in error_lower
+        or "reset by peer" in error_lower
+    ):
+        return True, "network_error"
+
+    # Default to non-retryable
+    return False, "other"
 
 
 def sanitize_gemini_model(model: Optional[str]) -> str:
@@ -204,12 +314,18 @@ def query_gemini_assistant(
     context: str,
     api_key: str,
     chat_history: Optional[List[Dict[str, str]]] = None,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    max_retries: int = MAX_GEMINI_RETRIES
 ) -> str:
     """
-    Sends the user query and grounded statistical context to Google Gemini.
+    Sends the user query and grounded statistical context to Google Gemini with
+    automatic retry for temporary errors (503 UNAVAILABLE, 429 RATE LIMIT, Network).
+    Uses exponential backoff with random jitter to prevent thundering herds.
     """
     active_model = sanitize_gemini_model(model or get_gemini_model())
+    last_error: Optional[Exception] = None
+    last_category: str = "other"
+
     try:
         from google import genai
         from google.genai import types
@@ -246,76 +362,117 @@ def query_gemini_assistant(
             f"Please provide an accurate, structured, and pedagogical answer:"
         )
 
-        # Call Gemini (gemini-3.8-flash is the active, supported model for tabular analysis)
-        response = client.models.generate_content(
-            model=active_model,
-            contents=full_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2,  # Low temperature for strict factual grounding
-                max_output_tokens=1500
-            )
-        )
+        # Retry loop: attempt 0 is initial try, attempts 1..max_retries are retries
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model=active_model,
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.2,  # Low temperature for strict factual grounding
+                        max_output_tokens=1500
+                    )
+                )
+                return response.text
 
-        return response.text
+            except Exception as e:
+                last_error = e
+                is_retryable, category = _is_retryable_error(e)
+                last_category = category
+
+                clean_err = _sanitize_log_message(str(e))
+
+                # Do not retry permanent errors or if all retries are exhausted
+                if not is_retryable or attempt >= max_retries:
+                    logger.error(
+                        "Gemini API request failed (category=%s, attempt=%d/%d, retryable=%s): %s",
+                        category, attempt + 1, max_retries + 1, is_retryable, clean_err
+                    )
+                    break
+
+                # Exponential backoff with random jitter
+                backoff = min(MAX_RETRY_DELAY, INITIAL_RETRY_DELAY * (2 ** attempt))
+                jitter = random.uniform(0.1, 0.5)
+                delay = backoff + jitter
+
+                logger.warning(
+                    "Gemini API temporary error (category=%s, attempt=%d/%d). Retrying in %.2fs... Error: %s",
+                    category, attempt + 1, max_retries + 1, delay, clean_err
+                )
+                _sleep_fn(delay)
 
     except Exception as e:
-        error_msg = str(e)
-        error_lower = error_msg.lower()
+        last_error = e
+        last_category = "client_init_error"
+        logger.error("Gemini client initialization error: %s", _sanitize_log_message(str(e)))
 
-        # 1. Invalid, not found, or deprecated model error (404)
-        if (
-            "not_found" in error_lower
-            or "404" in error_msg
-            or "is not found" in error_lower
-            or "no longer available" in error_lower
-            or "unsupported model" in error_lower
-            or ("models/" in error_lower and "not found" in error_lower)
-        ):
-            return (
-                f"❌ **Model Error (404):** The requested model (`{active_model}`) is unavailable or deprecated. "
-                f"InsightLab is configured to use `{DEFAULT_GEMINI_MODEL}`."
-            )
+    error_msg = str(last_error) if last_error else "Unknown error"
+    error_lower = error_msg.lower()
 
-        # 2. Invalid API key error (400 / 401)
-        elif (
-            "api_key_invalid" in error_lower
-            or "invalid api key" in error_lower
-            or "api key not valid" in error_lower
-            or ("invalid_argument" in error_lower and "key" in error_lower)
-        ):
-            return "❌ **API Key Error:** The provided Gemini API key is invalid. Please verify your API key in Streamlit secrets or in the API key settings."
+    # Friendly, actionable messages according to error category
+    if last_category == "503_unavailable" or "503" in error_msg or "unavailable" in error_lower:
+        return (
+            "⏳ **Gemini Service Temporarily Unavailable (503):** Google Gemini is currently experiencing "
+            f"temporary high demand. We automatically retried {max_retries} times with exponential backoff, "
+            "but the model remains busy. Please try your question again in a moment, or use the Local Analytical Engine."
+        )
 
-        # 3. Quota exceeded or rate limited (429)
-        elif "resource_exhausted" in error_lower or "429" in error_msg or "quota" in error_lower:
-            return "⏳ **Quota Exceeded (429):** You have reached your Gemini API request limit. Please wait a moment before trying again."
+    elif last_category == "429_rate_limit" or "429" in error_msg or "resource_exhausted" in error_lower or "quota" in error_lower:
+        return (
+            "⏳ **Quota Exceeded (429):** You have temporarily reached your Gemini API request limit. "
+            f"We retried {max_retries} times with exponential backoff, but the quota limit is still active. "
+            "Please wait a moment before sending another question."
+        )
 
-        # 4. Service disabled or permission denied (403)
-        elif (
-            "permission_denied" in error_lower
-            or "403" in error_msg
-            or "service_disabled" in error_lower
-            or "has not been used in project" in error_lower
-        ):
-            return (
-                "❌ **API Not Enabled (403):** Gemini API is disabled on this Google Cloud project. "
-                "Enable it at https://console.developers.google.com/apis/api/generativelanguage.googleapis.com/overview"
-            )
+    elif (
+        last_category == "model_not_found"
+        or "not_found" in error_lower
+        or "404" in error_msg
+        or "is not found" in error_lower
+        or "no longer available" in error_lower
+    ):
+        return (
+            f"❌ **Model Error (404):** The requested model (`{active_model}`) is unavailable or deprecated. "
+            f"InsightLab is configured to use `{DEFAULT_GEMINI_MODEL}`."
+        )
 
-        # 5. Network, connection, or timeout errors
-        elif (
-            "timeout" in error_lower
-            or "connection" in error_lower
-            or "network" in error_lower
-            or "getaddrinfo" in error_lower
-            or "disconnected" in error_lower
-            or "unreachable" in error_lower
-        ):
-            return f"🌐 **Network Error:** Could not connect to Gemini API ({error_msg}). Please check your internet connection."
+    elif (
+        last_category == "invalid_api_key"
+        or "api_key_invalid" in error_lower
+        or "invalid api key" in error_lower
+        or "api key not valid" in error_lower
+    ):
+        return (
+            "❌ **API Key Error:** The provided Gemini API key is invalid. "
+            "Please verify your API key in Streamlit secrets or in the API key settings."
+        )
 
-        # 6. General fallback
-        else:
-            return f"⚠️ **Connection Error:** Could not reach Gemini API: {error_msg}. Using local analytical engine fallback."
+    elif (
+        last_category == "permission_denied"
+        or "permission_denied" in error_lower
+        or "403" in error_msg
+        or "service_disabled" in error_lower
+        or "has not been used in project" in error_lower
+    ):
+        return (
+            "❌ **API Not Enabled (403):** Gemini API is disabled on this Google Cloud project. "
+            "Enable it at https://console.developers.google.com/apis/api/generativelanguage.googleapis.com/overview"
+        )
+
+    elif (
+        last_category == "network_error"
+        or "timeout" in error_lower
+        or "connection" in error_lower
+        or "network" in error_lower
+    ):
+        return (
+            f"🌐 **Network Connection Error:** Could not reach Gemini API after {max_retries} retry attempts "
+            f"({_sanitize_log_message(error_msg)}). Please check your internet connection."
+        )
+
+    else:
+        return f"⚠️ **Connection Error:** Could not reach Gemini API: {_sanitize_log_message(error_msg)}. Using local analytical engine fallback."
 
 
 def answer_query_deterministically(

@@ -14,8 +14,11 @@ import pandas as pd
 import numpy as np
 from utils.ai_assistant import (
     DEFAULT_GEMINI_MODEL,
+    MAX_GEMINI_RETRIES,
     sanitize_gemini_model,
     get_gemini_model,
+    _is_retryable_error,
+    _sanitize_log_message,
     build_dataset_context_summary,
     answer_query_deterministically,
     get_gemini_api_key,
@@ -165,10 +168,11 @@ class TestAIAssistant(unittest.TestCase):
             ans = query_gemini_assistant("test", "context", "bad-key")
             self.assertIn("API Key Error", ans)
 
-        # 3. Quota exceeded error
+        # 3. Quota exceeded error (permanent or exhausted)
         with patch("google.genai.Client", side_effect=Exception("RESOURCE_EXHAUSTED: 429 rate limit exceeded")):
-            ans = query_gemini_assistant("test", "context", "key")
-            self.assertIn("Quota Exceeded", ans)
+            with patch("utils.ai_assistant._sleep_fn"):
+                ans = query_gemini_assistant("test", "context", "key")
+                self.assertIn("Quota Exceeded", ans)
 
         # 4. Service disabled error
         with patch("google.genai.Client", side_effect=Exception("SERVICE_DISABLED: Gemini API has not been used")):
@@ -177,13 +181,86 @@ class TestAIAssistant(unittest.TestCase):
 
         # 5. Network / timeout error
         with patch("google.genai.Client", side_effect=Exception("ConnectionError: Failed to establish a connection to host")):
-            ans = query_gemini_assistant("test", "context", "key")
-            self.assertIn("Network Error", ans)
+            with patch("utils.ai_assistant._sleep_fn"):
+                ans = query_gemini_assistant("test", "context", "key")
+                self.assertIn("Network Connection Error", ans)
 
         # 6. General fallback error
         with patch("google.genai.Client", side_effect=Exception("Unexpected internal server state")):
             ans = query_gemini_assistant("test", "context", "key")
             self.assertIn("Connection Error", ans)
+
+    def test_is_retryable_error_classification(self):
+        """Test distinction between temporary and permanent errors."""
+        # Temporary
+        self.assertTrue(_is_retryable_error(Exception("503 UNAVAILABLE: high demand"))[0])
+        self.assertTrue(_is_retryable_error(Exception("429 RESOURCE_EXHAUSTED: quota exceeded"))[0])
+        self.assertTrue(_is_retryable_error(Exception("Connection reset by peer"))[0])
+        self.assertTrue(_is_retryable_error(Exception("502 Bad Gateway"))[0])
+
+        # Permanent (must not retry)
+        self.assertFalse(_is_retryable_error(Exception("API_KEY_INVALID: bad key"))[0])
+        self.assertFalse(_is_retryable_error(Exception("404 NOT_FOUND: model not found"))[0])
+        self.assertFalse(_is_retryable_error(Exception("403 PERMISSION_DENIED: service disabled"))[0])
+
+    def test_sanitize_log_message_redacts_credentials(self):
+        """Ensure API keys are redacted from logs and errors."""
+        msg = "Failed with key AIzaSyDg8IglpO26e1zGVaAWt1gpgyBTxug9BTc at endpoint"
+        sanitized = _sanitize_log_message(msg)
+        self.assertNotIn("AIzaSy", sanitized)
+        self.assertIn("[REDACTED_KEY]", sanitized)
+
+    @patch("utils.ai_assistant._sleep_fn")
+    def test_query_gemini_assistant_retries_503_max_3_times(self, mock_sleep):
+        """Verify 503 errors trigger up to 3 retries with exponential backoff and friendly message."""
+        mock_client = MagicMock()
+        err_503 = Exception("503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand.'}}")
+        mock_client.models.generate_content.side_effect = err_503
+
+        with patch("google.genai.Client", return_value=mock_client):
+            ans = query_gemini_assistant("Explain R2", "context", "key")
+
+            # Initial attempt + 3 retries = 4 calls total
+            self.assertEqual(mock_client.models.generate_content.call_count, 4)
+            # Sleep called 3 times (between attempts)
+            self.assertEqual(mock_sleep.call_count, 3)
+
+            # Friendly message returned
+            self.assertIn("Gemini Service Temporarily Unavailable (503)", ans)
+            self.assertIn("high demand", ans)
+            self.assertIn("automatically retried 3 times", ans)
+
+    @patch("utils.ai_assistant._sleep_fn")
+    def test_query_gemini_assistant_recovers_on_retry(self, mock_sleep):
+        """Verify successful generation after initial 503 failure."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "R-squared measures goodness of fit."
+
+        err_503 = Exception("503 UNAVAILABLE")
+        # Fail once with 503, succeed on 2nd attempt
+        mock_client.models.generate_content.side_effect = [err_503, mock_response]
+
+        with patch("google.genai.Client", return_value=mock_client):
+            ans = query_gemini_assistant("Explain R2", "context", "key")
+
+            self.assertEqual(ans, "R-squared measures goodness of fit.")
+            self.assertEqual(mock_client.models.generate_content.call_count, 2)
+            self.assertEqual(mock_sleep.call_count, 1)
+
+    @patch("utils.ai_assistant._sleep_fn")
+    def test_permanent_errors_do_not_retry(self, mock_sleep):
+        """Verify permanent errors (e.g. invalid key) exit immediately without retries."""
+        mock_client = MagicMock()
+        err_key = Exception("API_KEY_INVALID: The key is bad")
+        mock_client.models.generate_content.side_effect = err_key
+
+        with patch("google.genai.Client", return_value=mock_client):
+            ans = query_gemini_assistant("test", "context", "key")
+
+            self.assertEqual(mock_client.models.generate_content.call_count, 1)
+            self.assertEqual(mock_sleep.call_count, 0)
+            self.assertIn("API Key Error", ans)
 
 
 if __name__ == "__main__":
