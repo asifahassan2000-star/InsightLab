@@ -1,0 +1,30 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // =========================================================================
+    // INSIGHTLAB FIREBASE STORAGE SECURITY RULES
+    // =========================================================================
+    // Core Principle:
+    // Files are partitioned by authenticated user ID:
+    //   /users/{userId}/datasets/{fileName}
+    //   /users/{userId}/reports/{fileName}
+    //   /users/{userId}/exports/{fileName}
+    //   /users/{userId}/models/{fileName}
+    //
+    // A user can ONLY read, write, and delete files inside their own folder.
+    // File sizes are capped at 50MB to protect storage quotas.
+    // =========================================================================
+
+    match /users/{userId}/{allPaths=**} {
+      allow read, write, delete: if request.auth != null 
+                                 && request.auth.uid == userId
+                                 && (request.resource == null || request.resource.size < 50 * 1024 * 1024);
+    }
+
+    // Default deny for all other locations
+    match /{allPaths=**} {
+      allow read, write: false;
+    }
+  }
+}

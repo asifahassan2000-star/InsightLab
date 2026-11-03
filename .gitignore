@@ -1,0 +1,14 @@
+# Streamlit secrets (NEVER commit private keys or API keys)
+.streamlit/secrets.toml
+
+# Python cache & tests
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment files
+.env
+*.env
